@@ -17,6 +17,7 @@ from dify_plugin.entities.model.llm import (
 from dify_plugin.entities.model.message import (
     AssistantPromptMessage,
     PromptMessage,
+    PromptMessageTool,
     PromptMessageContentType,
     SystemPromptMessage,
     ToolPromptMessage,
@@ -111,8 +112,8 @@ class IncomingParams(BaseModel):
             thinking_budget = 1024
             final_max_tokens = 4096
             reasoning_effort = "medium"
-        itpm_limit = 30000
-        otpm_limit = 8000 if provider == "anthropic" else None
+        itpm_limit = 2_000_000 if "-mini" in model else 450_000
+        otpm_limit = 90_000 if provider == "anthropic" else None
         return Params(
             user_model=self.user_model,
             think=self.think,
@@ -130,9 +131,9 @@ class IncomingParams(BaseModel):
             final_max_tokens=final_max_tokens,
             itpm_limit=itpm_limit,
             otpm_limit=otpm_limit,
-            memory_summary_max_tokens=512,
-            summarize_history_when_chars_over=20_000,
-            initial_delay_secs=1,
+            memory_summary_max_tokens=256,
+            summarize_history_when_chars_over=10_000,
+            initial_delay_secs=5,
             delay_multiplier=2,
             retry_attempts=5,
         )
@@ -234,8 +235,10 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                 total += len(str(c))
         return total
 
-    def _rough_tokens(self, msgs: List[PromptMessage]) -> int:
-        return max(1, self._rough_chars(msgs) // 4)
+    def _rough_tokens(self, msgs: List[PromptMessage], tools: List[PromptMessageTool]) -> int:
+        chars = self._rough_chars(msgs)
+        tools_chars = sum(len(t.model_dump_json()) for t in tools)
+        return max(1, (chars + tools_chars) // 3)
 
     def _summarize_history(self, history: List[PromptMessage], provider: str, model: str, p: Params) -> Optional[str]:
         try:
@@ -324,7 +327,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                     return fn()
                 except Exception as e:  # include 429s
                     emsg = str(e)
-                    should_retry = any(tok in emsg.lower() for tok in ["rate", "429", "quota", "overloaded", "throttl"]) or attempt < p.retry_attempts
+                    should_retry = any(tok in emsg.lower() for tok in ["rate", "429", "529", "quota", "overloaded", "throttl"]) or attempt < p.retry_attempts
                     yield self.create_log_message(label=f"{label} retry {attempt}", data={"error": emsg}, status=ToolInvokeMessage.LogMessage.LogStatus.START)
                     if not should_retry or attempt == p.retry_attempts:
                         raise
@@ -366,9 +369,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
             completion_params["max_tokens"] = int(effective_max_tokens)
 
             # Estimate input and reserve tokens
-            input_estimate = self._rough_tokens(prompt_messages)
-            # tiny overhead for tool schemas carried in prompt
-            input_estimate += 32 * len(prompt_messages_tools)
+            input_estimate = self._rough_tokens(prompt_messages, prompt_messages_tools)
 
             if p.otpm_limit:  # Anthropic-style: separate out-bucket
                 need_in = float(max(1, input_estimate))
