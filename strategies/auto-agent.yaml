@@ -1,0 +1,16 @@
+identity:
+  name: auto-agent
+  author: quantum-pilot
+  label:
+    en_US: "AutoAgent"
+description:
+  en_US: "AutoAgent"
+parameters:
+  - name: tools
+    type: array[tools]
+    required: true
+    label:
+      en_US: Tools list
+extra:
+  python:
+    source: strategies/auto-agent.py

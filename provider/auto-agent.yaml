@@ -1,0 +1,13 @@
+identity:
+  author: quantum-pilot
+  name: auto-agent
+  label:
+    en_US: "AutoAgent"
+  description:
+    en_US: "AutoAgent"
+  icon: icon.svg
+strategies:
+  - strategies/auto-agent.yaml
+extra:
+  python:
+    source: provider/auto-agent.py
