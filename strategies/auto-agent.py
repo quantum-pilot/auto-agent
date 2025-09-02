@@ -308,7 +308,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
         prompt_messages_tools = self._init_prompt_tools(tools)
 
         # stream = (ModelFeature.STREAM_TOOL_CALL in p.model.entity.features) if (p.model.entity and p.model.entity.features) else False
-        stream = True  # force stream cuz both providers support it
+        stream = False  # FIXME: stream is currently broken with tool calls, force enable it after fix
         stop = (p.model.completion_params.get("stop", []) if p.model.completion_params else [])
 
         # function-calling loop
