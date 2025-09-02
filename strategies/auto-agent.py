@@ -2,7 +2,7 @@ import json
 import time
 from collections.abc import Generator
 from copy import deepcopy
-from typing import Any, Optional, Tuple, List, cast
+from typing import Any, Callable, Optional, Tuple, List, TypeVar, cast
 
 from pydantic import BaseModel
 
@@ -29,6 +29,8 @@ from dify_plugin.interfaces.agent import (
     ToolEntity,
     ToolInvokeMeta,
 )
+
+T = TypeVar("T")
 
 
 class LogMetadata:
@@ -77,37 +79,80 @@ class ExecutionMetadata(BaseModel):
         )
 
 
-class ContextItem(BaseModel):
-    content: str
-    title: str
-    metadata: dict[str, Any]
+PROVIDER_MODEL = {
+    "GPT-mini":         ("openai",    "gpt-5-mini-2025-08-07"),
+    "GPT":              ("openai",    "gpt-5-2025-08-07"),
+    "Claude-Sonnet":    ("anthropic", "claude-sonnet-4-20250514"),
+    "Opus":             ("anthropic", "claude-opus-4-1-20250805"),
+}
 
 
-class Config(BaseModel):
-    thinking_budget: int
-    tool_max_tokens: int
-    final_max_tokens: int
-    reasoning_effort: str
-    verbosity: str
-    itpm_limit: int
-    otpm_limit: Optional[int]
-    memory_summary_max_tokens: int = 512
-    summarize_history_when_chars_over: int = 8192
-
-class Params(BaseModel):
-    think: bool
-    provider: str
-    exact_model: str
-    config: Config
-
+class IncomingParams(BaseModel):
+    user_model: str
+    think: bool = False
     # agent scaffolding
     model: AgentModelConfig
     tools: List[ToolEntity] | None = None
+    instruction: str
     query: str
-    initial_delay_secs: int = 1
-    delay_multiplier: int = 2
-    retry_attempts: int = 5
     maximum_iterations: int = 15
+
+    def to_params(self) -> "Params":
+        if self.user_model.split(":")[-1] == "1":
+            self.think = True
+        self.user_model = self.user_model.split(":")[0]
+        provider, model = PROVIDER_MODEL.get(self.user_model, PROVIDER_MODEL["GPT-mini"])
+        tool_max_tokens   = 256
+        final_max_tokens  = 2048
+        thinking_budget = 0
+        reasoning_effort = "minimal"
+        verbosity        = "medium"
+        if self.think:
+            thinking_budget = 1024
+            final_max_tokens = 4096
+            reasoning_effort = "medium"
+        itpm_limit = 30000
+        otpm_limit = 8000 if provider == "anthropic" else None
+        return Params(
+            user_model=self.user_model,
+            think=self.think,
+            model=self.model,
+            tools=self.tools,
+            instruction=self.instruction,
+            query=self.query,
+            maximum_iterations=self.maximum_iterations,
+            provider=provider,
+            exact_model=model,
+            thinking_budget=thinking_budget,
+            reasoning_effort=reasoning_effort,
+            verbosity=verbosity,
+            tool_max_tokens=tool_max_tokens,
+            final_max_tokens=final_max_tokens,
+            itpm_limit=itpm_limit,
+            otpm_limit=otpm_limit,
+            memory_summary_max_tokens=512,
+            summarize_history_when_chars_over=20_000,
+            initial_delay_secs=1,
+            delay_multiplier=2,
+            retry_attempts=5,
+        )
+
+
+class Params(IncomingParams):
+    provider: str
+    exact_model: str
+    thinking_budget: int
+    reasoning_effort: str
+    verbosity: str
+    tool_max_tokens: int
+    final_max_tokens: int
+    itpm_limit: int
+    otpm_limit: Optional[int]
+    memory_summary_max_tokens: int
+    summarize_history_when_chars_over: int
+    initial_delay_secs: int
+    delay_multiplier: int
+    retry_attempts: int
 
 
 class TokenBuckets:
@@ -117,8 +162,6 @@ class TokenBuckets:
     - Anthropic: separate ITPM/OTPM; OTPM includes thinking budget.
     """
     def __init__(self, storage, key_prefix: str, itpm: int, otpm: Optional[int]):
-        import json as _json
-        import time as _time
         self.s = storage
         self.key_i = f"{key_prefix}:in"
         self.key_o = f"{key_prefix}:out" if otpm is not None else None
@@ -201,7 +244,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                 model=model,
                 mode="chat",
                 completion_params={
-                    "max_tokens": p.config.memory_summary_max_tokens,
+                    "max_tokens": p.memory_summary_max_tokens,
                     "verbosity": "low",
                     "reasoning_effort": "minimal",
                 },
@@ -213,7 +256,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
             ]
             res = self.session.model.llm.invoke(model_config=cfg, prompt_messages=prompt, tools=[], stream=False)
             if isinstance(res, LLMResult) and res.message and res.message.content:
-                return "".join(x.text for x in res.message.content if getattr(x, "text", None)) if isinstance(res.message.content, list) else str(res.message.content)
+                return "".join(x.data for x in res.message.content if x.type == PromptMessageContentType.TEXT) if isinstance(res.message.content, list) else str(res.message.content)
         except Exception:
             return None
         return None
@@ -237,17 +280,19 @@ class DynamicRouterAgentStrategy(AgentStrategy):
         return prompt_messages
 
     def _invoke(self, parameters: dict[str, Any]) -> Generator[AgentInvokeMessage, None, None]:
-        p = Params(**parameters)
+        p = IncomingParams(**parameters).to_params()
         provider, model = p.provider, p.exact_model
 
         # Build a storage for token buckets
         storage = self.session.storage
         bucket_key = f"rl:{provider}:{model}"
-        buckets = TokenBuckets(storage=storage, key_prefix=bucket_key, itpm=p.config.itpm_limit, otpm=p.config.otpm_limit)
+        buckets = TokenBuckets(storage=storage, key_prefix=bucket_key, itpm=p.itpm_limit, otpm=p.otpm_limit)
 
         # Prepare history (optional summarization for budget)
         history = p.model.history_prompt_messages or []
-        if self._rough_chars(history) > p.config.summarize_history_when_chars_over:
+        history.insert(0, SystemPromptMessage(content=p.instruction))
+        history.append(UserPromptMessage(content=p.query))
+        if self._rough_chars(history) > p.summarize_history_when_chars_over:
             yield self.create_log_message(label="Summarizing history", data={"chars": self._rough_chars(history)}, status=ToolInvokeMessage.LogMessage.LogStatus.START)
             summary = self._summarize_history(history, provider, model, p)
             if summary:
@@ -259,8 +304,8 @@ class DynamicRouterAgentStrategy(AgentStrategy):
         tool_instances = {tool.identity.name: tool for tool in tools} if tools else {}
         prompt_messages_tools = self._init_prompt_tools(tools)
 
-        # streaming capability
-        stream = (ModelFeature.STREAM_TOOL_CALL in p.model.entity.features) if (p.model.entity and p.model.entity.features) else False
+        # stream = (ModelFeature.STREAM_TOOL_CALL in p.model.entity.features) if (p.model.entity and p.model.entity.features) else False
+        stream = True  # force stream cuz both providers support it
         stop = (p.model.completion_params.get("stop", []) if p.model.completion_params else [])
 
         # function-calling loop
@@ -272,7 +317,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
         final_answer = ""
 
         # Retry/backoff helpers
-        def _with_retries(fn, *, label: str):
+        def _with_retries(fn: Callable[[], T], *, label: str) -> Generator[AgentInvokeMessage, None, T]:
             delay = max(0.0, float(p.initial_delay_secs))
             for attempt in range(1, int(p.retry_attempts) + 1):
                 try:
@@ -280,7 +325,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                 except Exception as e:  # include 429s
                     emsg = str(e)
                     should_retry = any(tok in emsg.lower() for tok in ["rate", "429", "quota", "overloaded", "throttl"]) or attempt < p.retry_attempts
-                    yield self.create_log_message(label=f"{label} retry {attempt}", data={"error": emsg}, status=ToolInvokeMessage.LogMessage.LogStatus.RUNNING)
+                    yield self.create_log_message(label=f"{label} retry {attempt}", data={"error": emsg}, status=ToolInvokeMessage.LogMessage.LogStatus.START)
                     if not should_retry or attempt == p.retry_attempts:
                         raise
                     time.sleep(delay)
@@ -300,7 +345,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
 
             # Decide token caps for this iteration
             is_last_round = iteration_step == max_iteration_steps
-            cap_out_base = p.config.final_max_tokens if is_last_round else p.config.tool_max_tokens
+            cap_out_base = p.final_max_tokens if is_last_round else p.tool_max_tokens
 
             # Build prompt
             prompt_messages = self._organize_prompt_messages(history_prompt_messages=history, current_thoughts=current_thoughts)
@@ -310,31 +355,22 @@ class DynamicRouterAgentStrategy(AgentStrategy):
             # Thinking and max_tokens interaction:
             # If "think" is enabled and provider is Anthropic, we treat max_tokens as thinking_budget + output_allowance
             effective_max_tokens = cap_out_base
-            if p.think and provider.lower().startswith("anthropic"):
-                effective_max_tokens = max(cap_out_base + int(p.config.thinking_budget), cap_out_base)
-                completion_params["thinking"] = {"enabled": True, "budget_tokens": int(p.config.thinking_budget)}
+            if p.think and provider == "anthropic":
+                effective_max_tokens = max(cap_out_base + int(p.thinking_budget), cap_out_base)
+                completion_params["thinking"] = {"enabled": True, "budget_tokens": int(p.thinking_budget)}
             elif p.think:
                 # OpenAI GPT-5 style knobs (no separate thinking budget parameter)
-                completion_params["reasoning_effort"] = p.config.reasoning_effort
+                completion_params["reasoning_effort"] = p.reasoning_effort
             # Always set verbosity for OpenAI-like models
-            completion_params["verbosity"] = p.config.verbosity
+            completion_params["verbosity"] = p.verbosity
             completion_params["max_tokens"] = int(effective_max_tokens)
-
-            # Before invoking, try to recalc against model context length
-            model_for_round = deepcopy(p.model)
-            model_for_round.completion_params = completion_params
-            prompt_messages_for_recalc = prompt_messages
-            if model_for_round.entity and model_for_round.completion_params:
-                self.recalc_llm_max_tokens(model_for_round.entity, prompt_messages_for_recalc, model_for_round.completion_params)
-                # keep the recalculated max in completion_params
-                effective_max_tokens = int(model_for_round.completion_params.get("max_tokens", effective_max_tokens))
 
             # Estimate input and reserve tokens
             input_estimate = self._rough_tokens(prompt_messages)
             # tiny overhead for tool schemas carried in prompt
             input_estimate += 32 * len(prompt_messages_tools)
 
-            if p.config.otpm_limit:  # Anthropic-style: separate out-bucket
+            if p.otpm_limit:  # Anthropic-style: separate out-bucket
                 need_in = float(max(1, input_estimate))
                 need_out = float(max(1, effective_max_tokens))
             else:  # OpenAI-style: reserve the greater of in/out in single TPM
@@ -345,35 +381,48 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                 label="Rate-limit reservation",
                 data={"need_in": need_in, "need_out": need_out, "provider": provider, "model": model},
                 parent=round_log,
-                status=ToolInvokeMessage.LogMessage.LogStatus.RUNNING,
+                status=ToolInvokeMessage.LogMessage.LogStatus.START,
             )
             buckets.reserve(need_in=need_in, need_out=need_out)
 
             # Invoke LLM (with retries)
             model_started_at = time.perf_counter()
+            model_config = LLMModelConfig(
+                provider=provider,
+                model=model,
+                mode="chat",
+                completion_params=completion_params,
+            )
             model_log = self.create_log_message(
-                label=f"{model_for_round.model} Thought",
+                label=f"{provider}:{model} thought",
                 data={},
-                metadata={LogMetadata.STARTED_AT: model_started_at, LogMetadata.PROVIDER: model_for_round.provider},
+                metadata={LogMetadata.STARTED_AT: model_started_at, LogMetadata.PROVIDER: provider},
                 parent=round_log,
                 status=ToolInvokeMessage.LogMessage.LogStatus.START,
             )
             yield model_log
 
             def _invoke_once():
-                model_config = LLMModelConfig(**model_for_round.model_dump(mode="json"))
-                return self.session.model.llm.invoke(
-                    model_config=model_config,
-                    prompt_messages=prompt_messages,
-                    stop=stop,
-                    stream=stream,
-                    tools=prompt_messages_tools if not (is_last_round and max_iteration_steps > 1) else [],
-                )
+                try:
+                    kwargs = {
+                        "model_config": model_config,
+                        "prompt_messages": prompt_messages,
+                        "stop": stop,
+                        "stream": stream,
+                        "tools": prompt_messages_tools if not (is_last_round and max_iteration_steps > 1) else [],
+                    }
+                    return self.session.model.llm.invoke(**kwargs)
+                except Exception as e:
+                    if "context length" in str(e).lower() or "max context" in str(e).lower():
+                        # shrink and retry once
+                        summary = self._summarize_history(history, provider, model, p)
+                        if summary:
+                            history[:] = [SystemPromptMessage(content=f"Conversation summary:\n{summary}")]
+                            kwargs["prompt_messages"] = self._organize_prompt_messages(history_prompt_messages=history, current_thoughts=current_thoughts)
+                            return self.session.model.llm.invoke(**kwargs)
+                    raise
 
-            chunks_or_result = None
-            for attempt_result in _with_retries(_invoke_once, label="LLM invoke"):
-                chunks_or_result = attempt_result
-                break
+            chunks_or_result = yield from _with_retries(_invoke_once, label="LLM invoke")
 
             tool_calls: list[tuple[str, str, dict[str, Any]]] = []
             response = ""
@@ -400,7 +449,7 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                         self._increase_usage(llm_usage, chunk.delta.usage)
                         current_llm_usage = chunk.delta.usage
             else:
-                result = cast(LLMResult, chunks_or_result)
+                result = chunks_or_result
                 if self._check_blocking_tool_calls(result):
                     function_call_state = True
                     tool_calls.extend(self._extract_blocking_tool_calls(result) or [])
@@ -431,10 +480,10 @@ class DynamicRouterAgentStrategy(AgentStrategy):
                     "tool_input": [{"name": n, "args": a} for _, n, a in tool_calls],
                 },
                 metadata={
+                    LogMetadata.PROVIDER: provider,
                     LogMetadata.STARTED_AT: model_started_at,
                     LogMetadata.FINISHED_AT: time.perf_counter(),
                     LogMetadata.ELAPSED_TIME: time.perf_counter() - model_started_at,
-                    LogMetadata.PROVIDER: model_for_round.provider,
                     LogMetadata.TOTAL_PRICE: current_llm_usage.total_price if current_llm_usage else 0,
                     LogMetadata.CURRENCY: current_llm_usage.currency if current_llm_usage else "",
                     LogMetadata.TOTAL_TOKENS: current_llm_usage.total_tokens if current_llm_usage else 0,
@@ -572,15 +621,9 @@ class DynamicRouterAgentStrategy(AgentStrategy):
 
             iteration_step += 1
 
-        # Emit retriever resources if any (stay compatible with FunctionCallingStrategy)
-        if isinstance(p.model.context, list):
-            # Some Dify deployments place context on Params, others on model; keep original behavior if available
-            pass
-
         metadata = ExecutionMetadata.from_llm_usage(llm_usage.get("usage"))
         yield self.create_json_message({"execution_metadata": metadata.model_dump()})
 
-    # --- Compatibility shims to reuse FunctionCallingAgentStrategy utilities ---
     def _check_tool_calls(self, llm_result_chunk: LLMResultChunk) -> bool:
         return bool(llm_result_chunk.delta.message.tool_calls)
 

@@ -4,13 +4,56 @@ identity:
   label:
     en_US: "AutoAgent"
 description:
-  en_US: "AutoAgent"
+  en_US: "History-aware rate-limited agent that dynamically routes by provider/model combo"
+features:
+  - history-messages
 parameters:
-  - name: tools
-    type: array[tools]
+  # Core routing & behavior
+  - name: user_model
+    type: string
     required: true
     label:
-      en_US: Tools list
+      en_US: User model
+
+  # Agent scaffolding
+  - name: tools
+    type: array[tools]
+    required: false
+    label:
+      en_US: Tools List
+  - name: instruction
+    type: string
+    required: true
+    label:
+      en_US: Instruction
+    auto_generate:
+      type: prompt_instruction
+    template:
+      enabled: true
+  - name: query
+    type: string
+    required: true
+    label:
+      en_US: Query
+  - name: maximum_iterations
+    type: number
+    required: true
+    min: 3
+    max: 50
+    default: 15
+    label:
+      en_US: "Maximum iterations"
+
+  # Unused
+  - name: model
+    type: model-selector
+    scope: tool-call&llm
+    required: true
+    default: gpt-5-nano-2025-08-07
+    label:
+      en_US: Model (unused)
+
+
 extra:
   python:
     source: strategies/auto-agent.py
