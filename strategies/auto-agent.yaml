@@ -9,11 +9,11 @@ features:
   - history-messages
 parameters:
   # Core routing & behavior
-  - name: user_model
+  - name: config
     type: string
     required: true
     label:
-      en_US: User model
+      en_US: Agent config json
 
   # Agent scaffolding
   - name: tools

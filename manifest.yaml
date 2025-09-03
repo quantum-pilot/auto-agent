@@ -21,7 +21,7 @@ resource:
       llm: true
     storage:
       enabled: true
-      size: 1048576
+      size: 10485760
 plugins:
   agent_strategies:
     - provider/auto-agent.yaml
